@@ -43,9 +43,13 @@
 #define Timer_WD_PCLK                   PCLK_TCPWM0_CLOCKS0
 #define Timer_WD_IRQN                   tcpwm_0_interrupts_0_IRQn
 
-#define Timer_100ms_TYPE                  TCPWM0_GRP0_CNT1
-#define Timer_100ms_PCLK                  PCLK_TCPWM0_CLOCKS1
-#define Timer_100ms_IRQN                  tcpwm_0_interrupts_1_IRQn
+#define Timer_100ms_TYPE                TCPWM0_GRP0_CNT1
+#define Timer_100ms_PCLK                PCLK_TCPWM0_CLOCKS1
+#define Timer_100ms_IRQN                tcpwm_0_interrupts_1_IRQn
+
+#define Timer_10ms_TYPE                TCPWM0_GRP0_CNT2
+#define Timer_10ms_PCLK                PCLK_TCPWM0_CLOCKS2
+#define Timer_10ms_IRQN                tcpwm_0_interrupts_2_IRQn
 
 // PWM
 #define PWM_DIV_NUM                     0u
@@ -77,6 +81,8 @@
 #define ANALOG_IN_SAMPLING_TIME_MIN_IN_NS       (412ull)
 #define DIV_ROUND_UP(a,b)                       (((a) + (b)/2) / (b))
 #define ADC_LOGICAL_CHANNEL                     0
+
+#define HALL_CHANGE_BUFFER_SIZE                 8
 
 /*****************************************************************************
 * Global variable definitions (declared in header file with 'extern')
@@ -383,15 +389,15 @@ HBMODE_cfg_t Floating =
 {
   .PWM_EN = 0,
   .AFW = 0,
-  .HBmode = 3,
+  .HBmode = 3, // suspect -> if set to 3, current will rise when lock //not proven
 };
 
 PID_t pid =
 {
   .dt = 0.1f,
-  .Kp = 0.4,
-  .Ki = 0.02,
-  .Kd = 0.0005,
+  .Kp = 1,
+  .Ki = 0,
+  .Kd = 0.1,
   .integral = 0.0f,
   .prevErr = 0.0f,
 };
@@ -409,7 +415,10 @@ uint32_t PWM_DC = 50;
 uint32_t PWM_CC0 = 1;
 uint8_t hall_state = 0;
 uint8_t old_hall_state = 6;
+
+uint8_t hall_buffer_idx = 8;
 uint32_t hall_change_count = 0;
+uint32_t hall_change_count_temp_buff[HALL_CHANGE_BUFFER_SIZE] = {0};
 uint32_t hall_change_count_temp = 0;
 uint32_t hall_RPM = 0;
 
@@ -421,7 +430,10 @@ cy_stc_adc_ch_status_t POT_ADC_STAT;
 uint16_t CSO_ADC_RES;
 cy_stc_adc_ch_status_t CSO_ADC_STAT;
 
+uint32_t CSO_ADC_THRESH = 0xBFF;
 uint8_t OCD_CNT;
+uint8_t OCD_CNT_THRESH = 50;
+bool OCD_ACT_RESET = 1;
 
 uint32_t hall_count_target;
 
@@ -458,10 +470,10 @@ void TLE9185_HBMODE_Set(HBMODE_cfg_t PWMA, HBMODE_cfg_t PWMB, HBMODE_cfg_t PWMC)
 
 void Timer_Init();
 void Timer_100ms_Handler();
+void Timer_10ms_Handler();
 void Timer_WD_Handler();
 
 void Hall_Init();
-void Hall_Handler();
 void Hall_RPM_Count();
 
 void PWM_Init();
@@ -509,10 +521,10 @@ int main(void)
   PWM_Init();
   
   Hall_Init();
-  Hall_Handler();
   
   for(;;)
   {
+    Cy_SysTick_DelayInUs(10);
     PWM_BLDC_Control();
     
     if (BLDC_reset)
@@ -759,7 +771,7 @@ void TLE9185_LS_VDS_Set(uint8_t vdsth, bool deep_adap, uint8_t tfvds)
 void TLE9185_CSA_Set(uint8_t octh, uint8_t csag, bool ocen)
 {
   uint16_t ToSend = 0;
-  ToSend = ((0<<10)&0x400)|((1<<9)&0x200)|((0<<8)&0x100)|((1<<6)&0xC0)|((0<<5)&0x20)|((3<<3)&0x18)|((2<<1)&0x6)|(0&0x0);
+  ToSend = ((0<<10)&0x400)|((1<<9)&0x200)|((1<<8)&0x100)|((1<<6)&0xC0)|((0<<5)&0x20)|((3<<3)&0x18)|((2<<1)&0x6)|(0&0x0);
   SPI_WriteReg(REG_ADDR_CSA, ToSend);
 };
 
@@ -826,6 +838,7 @@ void Timer_Init()
   
   Cy_SysClk_PeriphAssignDivider(Timer_WD_PCLK, CY_SYSCLK_DIV_16_BIT, Timer_DIV_NUM);
   Cy_SysClk_PeriphAssignDivider(Timer_100ms_PCLK, CY_SYSCLK_DIV_16_BIT, Timer_DIV_NUM);
+  Cy_SysClk_PeriphAssignDivider(Timer_10ms_PCLK, CY_SYSCLK_DIV_16_BIT, Timer_DIV_NUM);
   Cy_SysClk_PeriphSetDivider(CY_SYSCLK_DIV_16_BIT, Timer_DIV_NUM, (divNum-1ul));  
   Cy_SysClk_PeriphEnableDivider(CY_SYSCLK_DIV_16_BIT, Timer_DIV_NUM);
   
@@ -838,6 +851,10 @@ void Timer_Init()
   Cy_SysInt_InitIRQ(&timer_irq_cfg);
   Cy_SysInt_SetSystemIrqVector(timer_irq_cfg.sysIntSrc, Timer_100ms_Handler);
   
+  timer_irq_cfg.sysIntSrc = Timer_10ms_IRQN;
+  Cy_SysInt_InitIRQ(&timer_irq_cfg);
+  Cy_SysInt_SetSystemIrqVector(timer_irq_cfg.sysIntSrc, Timer_10ms_Handler);
+  
   NVIC_SetPriority(timer_irq_cfg.intIdx, 3ul);
   NVIC_EnableIRQ(timer_irq_cfg.intIdx);
   
@@ -849,22 +866,47 @@ void Timer_Init()
   timer_cfg.clockPrescaler     = CY_TCPWM_PRESCALER_DIVBY_64, 
   Cy_Tcpwm_Counter_Init(Timer_100ms_TYPE, &timer_cfg);
   
+  // Timer 100ms
+  timer_cfg.period = 625;
+  timer_cfg.clockPrescaler     = CY_TCPWM_PRESCALER_DIVBY_32, 
+  Cy_Tcpwm_Counter_Init(Timer_10ms_TYPE, &timer_cfg);
+  
   Cy_Tcpwm_Counter_Enable(Timer_WD_TYPE);
   Cy_Tcpwm_Counter_Enable(Timer_100ms_TYPE);
+  Cy_Tcpwm_Counter_Enable(Timer_10ms_TYPE);
   
   Cy_Tcpwm_Counter_SetTC_IntrMask(Timer_WD_TYPE); 
   Cy_Tcpwm_Counter_SetTC_IntrMask(Timer_100ms_TYPE);
+  Cy_Tcpwm_Counter_SetTC_IntrMask(Timer_10ms_TYPE);
   
   Cy_Tcpwm_TriggerStart(Timer_WD_TYPE);
   Cy_Tcpwm_TriggerStart(Timer_100ms_TYPE);
+  Cy_Tcpwm_TriggerStart(Timer_10ms_TYPE);
 };
+
+void Timer_10ms_Handler(void)
+{
+  if(Cy_Tcpwm_Counter_GetTC_IntrMasked(Timer_10ms_TYPE) == 1ul)
+  {
+    Cy_Adc_Channel_SoftwareTrigger(&PASS0_SAR1->CH[ADC_LOGICAL_CHANNEL]);
+    Cy_Tcpwm_Counter_ClearTC_Intr(Timer_10ms_TYPE);
+  }
+}
 
 void Timer_100ms_Handler(void)
 {
   if(Cy_Tcpwm_Counter_GetTC_IntrMasked(Timer_100ms_TYPE) == 1ul)
   {
-    hall_change_count = hall_change_count_temp;
+    hall_buffer_idx = (hall_buffer_idx + 1) % HALL_CHANGE_BUFFER_SIZE;
+    hall_change_count_temp_buff[hall_buffer_idx] = hall_change_count_temp;
     hall_change_count_temp = 0;
+    
+    int sum = 0;
+    for (int i = 0; i < HALL_CHANGE_BUFFER_SIZE; i++)
+    {
+      sum += hall_change_count_temp_buff[i];
+    }
+    hall_change_count = (uint32_t) (sum / HALL_CHANGE_BUFFER_SIZE);    
     
     if (!hall_change_count && hall_count_target)
     {
@@ -877,7 +919,7 @@ void Timer_100ms_Handler(void)
     OCD_CNT = 0;
     
     // PID
-    PWM_CC0 = clamp(PWM_CC0 + PID_Update(&pid, hall_change_count, hall_count_target), 1, 140);
+    PWM_CC0 = clamp(PWM_CC0 + PID_Update(&pid, hall_change_count, hall_count_target), 1, 200);
     
     Cy_Tcpwm_Counter_ClearTC_Intr(Timer_100ms_TYPE);
   }
@@ -893,13 +935,15 @@ void Timer_WD_Handler(void)
     // Count RPM
     Hall_RPM_Count();
     
+    Cy_Adc_Channel_SoftwareTrigger(&BB_POTI_ANALOG_MACRO->CH[ADC_LOGICAL_CHANNEL]);
+    
     // ADC
-    if (POT_ADC_RES > 320)
+    if (POT_ADC_RES > 120)
     {
-      hall_count_target = POT_ADC_RES / 155;
+      hall_count_target = POT_ADC_RES / 120;
     } else
     {
-      hall_count_target = 3;
+      hall_count_target = 0;
     }
     
     Cy_Tcpwm_Counter_ClearTC_Intr(Timer_WD_TYPE);
@@ -913,35 +957,16 @@ void Hall_Init()
     .outVal    = 0ul,
     .driveMode = CY_GPIO_DM_HIGHZ, //Check
     .hsiom     = 0,
-    .intEdge   = CY_GPIO_INTR_BOTH,
-    .intMask   = 1ul,
+    .intEdge   = CY_GPIO_INTR_DISABLE,
+    .intMask   = 0ul,
     .vtrip     = 0ul,
     .slewRate  = 0ul,
     .driveSel  = 0ul,
   };
   
-  cy_stc_sysint_irq_t hall_irq_cfg = 
-  {
-    .sysIntSrc  = ioss_interrupts_gpio_7_IRQn,
-    .intIdx     = CPUIntIdx2_IRQn,
-    .isEnabled  = true,
-  };
-  
-//  Cy_SysInt_InitIRQ(&hall_irq_cfg);
-//  Cy_SysInt_SetSystemIrqVector(hall_irq_cfg.sysIntSrc, Hall_Handler);
-//  NVIC_SetPriority(hall_irq_cfg.intIdx, 0ul);
-//  NVIC_EnableIRQ(hall_irq_cfg.intIdx);
-  
   Cy_GPIO_Pin_Init(GPIO_PRT7, 3, &hall_ch_pin_cfg); //HALL1
   Cy_GPIO_Pin_Init(GPIO_PRT7, 4, &hall_ch_pin_cfg); //HALL2
   Cy_GPIO_Pin_Init(GPIO_PRT7, 5, &hall_ch_pin_cfg); //HALL3
-};
-
-void Hall_Handler()
-{
-//  hall_state = (GPIO_PRT7->unIN.u32Register >> 3);
-//  hall_change_count_temp++;
-//  GPIO_PRT7->unINTR.u32Register = 0x38;
 };
 
 void Hall_RPM_Count()
@@ -1018,11 +1043,17 @@ void PWM_BLDC_Control()
   {
     return;
   }
+    
+  Cy_SysTick_DelayInUs(10);
   
   if (old_hall_state != hall_state)
   {
     hall_change_count_temp++;
   }
+  
+  PWM_A_TYPE->unTR_CMD.stcField.u1STOP = 1;
+  PWM_B_TYPE->unTR_CMD.stcField.u1STOP = 1;
+  PWM_C_TYPE->unTR_CMD.stcField.u1STOP = 1;
   
   old_hall_state = hall_state;
 
@@ -1101,7 +1132,7 @@ void PWM_BLDC_Control()
     break;
   }
   
-    Cy_SysTick_DelayInUs(2000);
+//    Cy_SysTick_DelayInUs(2000);
     
 //    SPI_WriteReg(REG_ADDR_DEV_STAT, 0);
 //    Cy_SysTick_DelayInUs(2000);
@@ -1122,7 +1153,7 @@ int PID_Update(PID_t *pid, int val, int target) {
   pid->integral += err * dt;
   float I = pid->Ki * pid->integral;
   
-  float derivative = (err - pid->prevErr) / dt;
+  float derivative = (pid->prevErr - err) / dt;
   float D = pid->Kd * derivative;
   pid->prevErr = err;
   int pidval = (int)(P + I + D);
@@ -1237,6 +1268,9 @@ void SPI_WriteReg(uint8_t addr, uint16_t data)
 
 void SPI_ReadReg(uint8_t addr)
 {
+  while (SPI_Pending);
+  
+  SPI_Pending = 1;
   Cy_GPIO_Write(GPIO_PRT21, 5, 0);
   
   SPI_Send_data[0] = (addr | TLE9xxx_CMD_READ);
@@ -1271,7 +1305,6 @@ void POT_ADC_ISR(void)
   {
     Cy_Adc_Channel_GetResult(&BB_POTI_ANALOG_MACRO->CH[ADC_LOGICAL_CHANNEL], &POT_ADC_RES, &POT_ADC_STAT);
     Cy_Adc_Channel_ClearInterruptStatus(&BB_POTI_ANALOG_MACRO->CH[ADC_LOGICAL_CHANNEL], &intrSource);
-    Cy_Adc_Channel_SoftwareTrigger(&BB_POTI_ANALOG_MACRO->CH[ADC_LOGICAL_CHANNEL]);
   }
 }
 
@@ -1282,17 +1315,23 @@ void CSO_ADC_ISR(void)
   
   if(intrSource.chRange)
   {
-    //Cy_Adc_Channel_GetResult(&PASS0_SAR1->CH[ADC_LOGICAL_CHANNEL], &CSO_ADC_RES, &CSO_ADC_STAT);
+    Cy_Adc_Channel_GetResult(&PASS0_SAR1->CH[ADC_LOGICAL_CHANNEL], &CSO_ADC_RES, &CSO_ADC_STAT);
     
-    OCD_CNT++;
-    if (OCD_CNT > 5) 
+    if (CSO_ADC_RES > CSO_ADC_THRESH)
+    {
+      OCD_CNT++;
+    }
+
+    if (OCD_CNT > OCD_CNT_THRESH) 
     {
       OCD_CNT = 0;
-      BLDC_reset = 1;
+      if (OCD_ACT_RESET)
+      {
+        BLDC_reset = 1;
+      }
     }
     
     Cy_Adc_Channel_ClearInterruptStatus(&PASS0_SAR1->CH[ADC_LOGICAL_CHANNEL], &intrSource);
-    Cy_Adc_Channel_SoftwareTrigger(&PASS0_SAR1->CH[ADC_LOGICAL_CHANNEL]);
   }
 }
 
@@ -1373,7 +1412,7 @@ void ADC_Init(void)
   
   adcChannelConfig.pinAddress                   = ((cy_en_adc_pin_address_t)14);
   adcChannelConfig.postProcessingMode           = CY_ADC_POST_PROCESSING_MODE_RANGE,
-  adcChannelConfig.rangeDetectionMode           = CY_ADC_RANGE_DETECTION_MODE_ABOVE_HI;
+  adcChannelConfig.rangeDetectionMode           = CY_ADC_RANGE_DETECTION_MODE_OUTSIDE_RANGE;
   adcChannelConfig.rangeDetectionHiThreshold    = 0x0BFF;
   adcChannelConfig.mask.grpDone                 = false;
   adcChannelConfig.mask.chRange                 = true;
