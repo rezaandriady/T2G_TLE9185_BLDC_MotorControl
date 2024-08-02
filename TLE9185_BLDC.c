@@ -1,4 +1,3 @@
-
 /***************************************************************************//**
 * \file main_cm0.c
 *
@@ -25,6 +24,9 @@
 /*****************************************************************************
 * Local pre-processor symbols/macros ('define')
 *****************************************************************************/
+#define VCU_CONNECT                     0
+#define PID_UPDATE                      1
+
 #define TLE9xxx_CMD_WRITE          	0x80
 #define TLE9xxx_CMD_READ          	0x00
 #define TLE9xxx_CMD_CLEAR          	0x80
@@ -395,7 +397,7 @@ HBMODE_cfg_t Floating =
 PID_t pid =
 {
   .dt = 0.1f,
-  .Kp = 1,
+  .Kp = 0.5,
   .Ki = 0,
   .Kd = 0.1,
   .integral = 0.0f,
@@ -479,9 +481,13 @@ void Hall_RPM_Count();
 void PWM_Init();
 void PWM_BLDC_Control();
 
-void PID_Reset(PID_t *controller);
-int PID_Update(PID_t *pid, int actual, int target);
 int clamp(int val, int min, int max);
+#if (PID_UPDATE)
+int PID_Update(PID_t *pid, int actual, int target);
+#else
+int PWM_CC0_Update(void);
+#endif
+void PID_Reset(PID_t *controller);
 
 void SPI_Init();
 void SPI_WriteReg(uint8_t addr, uint16_t data);
@@ -918,9 +924,11 @@ void Timer_100ms_Handler(void)
     
     OCD_CNT = 0;
     
-    // PID
+#if (PID_UDPDATE) // PID
     PWM_CC0 = clamp(PWM_CC0 + PID_Update(&pid, hall_change_count, hall_count_target), 1, 200);
-    
+#else // Simple PWM_CC0 Increment/ Decrement
+    PWM_CC0 = clamp(PWM_CC0_Update(), 1, 200);
+#endif
     Cy_Tcpwm_Counter_ClearTC_Intr(Timer_100ms_TYPE);
   }
 }
@@ -1038,25 +1046,30 @@ void PWM_BLDC_Control()
 {
   // Read Hall States
   hall_state = (GPIO_PRT7->unIN.u32Register >> 3);
+  
+  if ((hall_state == 7) || (hall_state == 0))
+  {
+    return;
+  }
 
   if (old_hall_state == hall_state && !BLDC_rampup)
   {
     return;
   }
-    
-  Cy_SysTick_DelayInUs(10);
   
   if (old_hall_state != hall_state)
   {
     hall_change_count_temp++;
   }
   
+  old_hall_state = hall_state;
+  
   PWM_A_TYPE->unTR_CMD.stcField.u1STOP = 1;
   PWM_B_TYPE->unTR_CMD.stcField.u1STOP = 1;
   PWM_C_TYPE->unTR_CMD.stcField.u1STOP = 1;
   
-  old_hall_state = hall_state;
-
+  Cy_SysTick_DelayInUs(10);
+ 
   // Next BLDC Sector
   {
     uint8_t hall_state_index = 0;
@@ -1129,15 +1142,9 @@ void PWM_BLDC_Control()
     break;
     
   default:
+    Cy_SysTick_DelayInUs(10);
     break;
   }
-  
-//    Cy_SysTick_DelayInUs(2000);
-    
-//    SPI_WriteReg(REG_ADDR_DEV_STAT, 0);
-//    Cy_SysTick_DelayInUs(2000);
-//    SPI_WriteReg(REG_ADDR_SUP_STAT, 0);
-//    Cy_SysTick_DelayInUs(2000);
 }
 
 void PID_Reset(PID_t *pid) {
@@ -1145,6 +1152,7 @@ void PID_Reset(PID_t *pid) {
   pid->prevErr = 0.0f;
 }
 
+if (PID_UPDATE)
 int PID_Update(PID_t *pid, int val, int target) {
   float dt = pid->dt;  
   float err = (float)(target - val);
@@ -1156,10 +1164,38 @@ int PID_Update(PID_t *pid, int val, int target) {
   float derivative = (pid->prevErr - err) / dt;
   float D = pid->Kd * derivative;
   pid->prevErr = err;
-  int pidval = (int)(P + I + D);
+  int pidval = (int)(P + I - D);
   
-  return (int)(P + I + D);
+  return (int)(P + I - D);
 }
+#else
+int PWM_CC0_Update()
+{
+  if (hall_change_count < hall_count_target)
+  {
+    if ((hall_count_target - hall_change_count) > 20)
+    {
+      return (int)(PWM_CC0 + 5);
+    } else
+    {
+      return (int)(PWM_CC0 + 1);
+    }
+  } else if (hall_change_count > hall_count_target)
+  {
+    if ((hall_change_count - hall_count_target) > 20)
+    {
+      return (int)(PWM_CC0 - 5);
+    } else
+    {
+      return (int)(PWM_CC0 - 1);
+    }
+  }
+  else if (hall_change_count == hall_count_target)
+  {
+    return (int)PWM_CC0;
+  }
+}
+#endif
 
 int clamp(int val, int min, int max) {
   if (val < min) return min;
